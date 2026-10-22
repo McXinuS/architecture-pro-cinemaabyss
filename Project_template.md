@@ -5,7 +5,42 @@
 1. Спроектируйте to be архитектуру КиноБездны, разделив всю систему на отдельные домены и организовав интеграционное взаимодействие и единую точку вызова сервисов.
 Результат представьте в виде контейнерной диаграммы в нотации С4.
 Добавьте ссылку на файл в этот шаблон
-[ссылка на файл](ссылка)
+
+### Решение
+
+[C4 Container](docs/cinemaabyss-tobe-containers.puml)
+
+Целевая система заменяет монолит шестью доменными сервисами. У каждого своя схема PostgreSQL, общая база не используется. Клиенты (веб, мобильное приложение, Smart TV) ходят только в API Gateway: это единственная точка вызова.
+
+Домены совпадают с предметными областями из описания продукта:
+
+| Домен | Ответственность | Данные |
+| --- | --- | --- |
+| Users | Регистрация, вход, профиль, папки избранного | users, избранное |
+| Movies | Метаданные: описание, жанры, актёры, оценки | movies, genres, ratings |
+| Video | Ссылка на поток, хранение и факт просмотра | ссылки на внешние потоки, файлы в объектном хранилище, прогресс |
+| Subscriptions | Тариф и срок подписки | subscriptions |
+| Payments | Списание и статус транзакции | payments |
+| Discounts | Скидки и промокоды | правила скидок |
+
+Избранное остаётся в Users: это данные зрителя, а не каталога. Оценки остаются в Movies, потому что в текущей модели они часть метаданных фильма. Video отделён от Movies: метаданные и поток меняются по разным причинам. Сам сервис хранит в PostgreSQL только ссылки и прогресс; собственные и кэшированные видеофайлы размещаются в объектном хранилище и раздаются через CDN. Внешний контент Video получает через API стриминговых сервисов и открытых источников.
+
+### Интеграция
+
+Синхронный REST используется там, где клиенту нужен ответ сразу. Gateway маршрутизирует запрос и подстраивает размер ответа под тип устройства. Перед выдачей потока gateway проверяет подписку. Payments синхронно спрашивает Discounts сумму до обращения к платёжному провайдеру.
+
+Остальные связи между доменами асинхронные, через Kafka:
+
+- Users публикует `user.registered` и `user.logged_in`.
+- Movies публикует `movie.added` и `movie.rated`.
+- Video публикует `movie.viewed`.
+- Payments публикует `payment.succeeded` и `payment.failed`.
+- Subscriptions подписывается на `payment.succeeded` и открывает или продлевает подписку.
+- Рекомендательная система подписана на просмотры и оценки. Gateway забирает у неё готовую подборку по REST.
+
+Сервис `events` из репозитория — не отдельный домен. Это переходный способ записать события user, movie и payment в Kafka. В целевой схеме те же топики публикуют доменные сервисы.
+
+Монолита в целевой схеме нет. Пока идёт перенос, gateway оставляет его за собой и переключает трафик по фиче-флагу (Strangler Fig): сначала movies, затем остальные домены. Развёртывание — Kubernetes, наружу смотрит только ingress перед gateway.
 
 
 ## Задание 2
@@ -47,6 +82,30 @@
    ```
 - Протестируйте постепенный переход, изменив переменную окружения MOVIES_MIGRATION_PERCENT в файле docker-compose.yml.
 
+#### Решение
+
+Прокси написан на Go без внешних зависимостей: [src/microservices/proxy](src/microservices/proxy/main.go).
+
+Запрос в `/api/movies` уходит в movies с вероятностью `MOVIES_MIGRATION_PERCENT`, иначе в монолит
+
+- `GRADUAL_MIGRATION: "true"` включает постепенный переход по проценту.
+- `GRADUAL_MIGRATION: "false"` отправляет весь домен movies в новый сервис, как описано в README.
+- Процент ограничен диапазоном 0–100; некорректное значение считается за 0, и трафик остаётся в монолите.
+
+Прокси пишет в лог маршрут каждого запроса и добавляет заголовок `X-Routed-To` (`monolith`, `movies` или `events`). По этому заголовку видно, куда попал запрос:
+
+```bash
+for i in $(seq 1 200); do
+  curl -s -o /dev/null -D - http://localhost:8000/api/movies | grep -i x-routed-to
+done | sort | uniq -c
+```
+
+| `MOVIES_MIGRATION_PERCENT` | Результат |
+| --- | --- |
+| `0` | 50 из 50 — monolith |
+| `50` | 97 из 200 — movies, 103 — monolith |
+| `100` | 50 из 50 — movies |
+
 ### 2. Kafka
  Вам как архитектуру нужно также проверить гипотезу насколько просто реализовать применение Kafka в данной архитектуре.
 
@@ -58,6 +117,46 @@
 
 Необходимые тесты для проверки этого API вызываются при запуске npm run test:local из папки tests/postman 
 Приложите скриншот тестов и скриншот состояния топиков Kafka http://localhost:8090 
+
+#### Решение
+
+Сервис events также написан на Go, с библиотекой [IBM/sarama](https://github.com/IBM/sarama).
+
+| Эндпоинт | Топик |
+| --- | --- |
+| `POST /api/events/movie` | `movie-events` |
+| `POST /api/events/user` | `user-events` |
+| `POST /api/events/payment` | `payment-events` |
+
+- Producer синхронный: ответ `201` возвращается только после подтверждения от Kafka. В ответе — партиция, смещение и само событие, как в `EventResponse` из спецификации.
+- Consumer group `events-service` читает все три топика и пишет каждое событие в лог сервиса.
+- Обязательные поля проверяются по спецификации; при ошибке сервис отвечает `400`.
+- Kafka в docker-compose поднимается дольше сервиса, поэтому producer и consumer переподключаются раз в 3 секунды. Пока Kafka недоступна, POST отвечает `503`, health-check — `200`.
+
+Лог сервиса после прогона тестов:
+
+```
+Produced movie event movie-6-viewed to movie-events [partition 0, offset 1]
+Consumed movie event movie-6-viewed from movie-events [partition 0, offset 1]: {"movie_id":6,"title":"Test Movie Event","action":"viewed","user_id":4}
+Produced user event user-4-logged_in to user-events [partition 0, offset 0]
+Consumed user event user-4-logged_in from user-events [partition 0, offset 0]: {"user_id":4,"username":"testuser","action":"logged_in","timestamp":"2026-10-15T02:08:11.381Z"}
+Produced payment event payment-4-completed to payment-events [partition 0, offset 0]
+Consumed payment event payment-4-completed from payment-events [partition 0, offset 0]: {"payment_id":4,"user_id":4,"amount":9.99,"status":"completed","timestamp":"2026-10-15T02:08:11.498Z","method_type":"credit_card"}
+```
+
+В `docker-compose.yml` монолит и movies теперь ждут, пока Postgres пройдёт health-check: при одновременном старте оба падали с `connection refused`. У events убрана зависимость от Postgres — база ему не нужна.
+
+Postman-тесты: 22 запроса, 42 проверки, 0 ошибок.
+
+![Postman-тесты](docs/screenshots/task2-postman-tests.png)
+
+Топики Kafka в Kafka UI:
+
+![Топики Kafka](docs/screenshots/task2-kafka-topics.png)
+
+Сообщения в топике `movie-events`:
+
+![Сообщения movie-events](docs/screenshots/task2-kafka-messages.png)
 
 
 ## Задание 3
@@ -109,6 +208,13 @@ jobs:
 ```
 Как только сборка отработает и в github registry появятся ваши образы, можно переходить к блоку настройки Kubernetes
 Успешным результатом данного шага является "зеленая" сборка и "зеленые" тесты
+
+#### Решение
+
+- В [docker-build-push.yml](.github/workflows/docker-build-push.yml) добавлена сборка и публикация образов `events-service` и `proxy-service` — по тому же шаблону, что monolith и movies.
+- Оба workflow запускаются на push в рабочую ветку `cinema` (и в `main`); `api-tests` — ещё и на каждый pull request.
+- При push образы публикуются в `ghcr.io/mcxinus/architecture-pro-cinemaabyss/<сервис>` с тегами `latest`, short sha и именем ветки.
+- Кнопка «Run workflow» для `workflow_dispatch` в интерфейсе GitHub есть только у workflow из ветки по умолчанию (`main`), поэтому основной способ запустить сборку — push в рабочую ветку.
 
 
 ### Proxy в Kubernetes
@@ -250,6 +356,15 @@ cat .docker/config.json | base64
   ```bash
   minikube addons enable ingress
   ```
+  Создайте локальный TLS-сертификат и Secret (ключи не хранятся в репозитории):
+  ```bash
+  openssl req -x509 -nodes -days 30 -newkey rsa:2048 \
+    -keyout /tmp/cinemaabyss.key -out /tmp/cinemaabyss.crt \
+    -subj "/CN=cinemaabyss.example.com" \
+    -addext "subjectAltName=DNS:cinemaabyss.example.com"
+  kubectl -n cinemaabyss create secret tls cinemaabyss-tls \
+    --key /tmp/cinemaabyss.key --cert /tmp/cinemaabyss.crt
+  ```
   ```bash
   kubectl apply -f src/kubernetes/ingress.yaml
   ```
@@ -271,8 +386,31 @@ cat .docker/config.json | base64
   Часть тестов с health-чек упадет, но создание событий отработает.
   Откройте логи event-service и сделайте скриншот обработки событий
 
+#### Решение шагов 1–2
+
+- Образы в `monolith.yaml`, `movies-service.yaml`, `events-service.yaml` и `proxy-service.yaml` указывают на `ghcr.io/mcxinus/architecture-pro-cinemaabyss/...`.
+- [events-service.yaml](src/kubernetes/events-service.yaml): Deployment и Service на порту 8082. Kafka задана как `kafka:9092`; readiness проверяет Kafka через `/api/events/health`, а liveness проверяет процесс через `/health`.
+- [proxy-service.yaml](src/kubernetes/proxy-service.yaml): Deployment и Service на порту 8000. Адреса сервисов и настройки миграции берутся из `cinemaabyss-config`, health-check — `/health`.
+- В [configmap.yaml](src/kubernetes/configmap.yaml) добавлен `EVENTS_SERVICE_URL`.
+- В [ingress.yaml](src/kubernetes/ingress.yaml) HTTPS-трафик направляется только в `proxy-service:8000`, поэтому API Gateway остаётся единой внешней точкой входа.
+- `dockerconfigsecret.yaml` содержит валидную анонимную конфигурацию для публичных GHCR-образов. Для приватных образов её нужно заменить по инструкции из шага 1; токен в репозиторий не коммитится.
+
 #### Шаг 3
 Добавьте сюда скриншота вывода при вызове https://cinemaabyss.example.com/api/movies и  скриншот вывода event-service после вызова тестов.
+
+#### Решение шага 3
+
+Кластер поднят в minikube (драйвер docker) по шагам выше, все поды в статусе `Running`. Ingress-контроллер minikube на драйвере docker доступен напрямую по `minikube ip`, поэтому вместо `127.0.0.1` + `minikube tunnel` домен `cinemaabyss.example.com` можно направить на этот адрес.
+
+`npm run test:kubernetes`: 22 запроса, 42 проверки, 0 ошибок.
+
+Вызов https://cinemaabyss.example.com/api/movies — при `MOVIES_MIGRATION_PERCENT: "100"` запрос уходит в movies (`x-routed-to: movies`):
+
+![Ответ /api/movies через ingress](docs/screenshots/task3-k8s-movies-api.png)
+
+Логи events-service после прогона тестов — события movie, user и payment записаны в Kafka и прочитаны consumer'ом:
+
+![Логи events-service](docs/screenshots/task3-k8s-events-logs.png)
 
 
 ## Задание 4
@@ -349,6 +487,29 @@ minikube tunnel
 https://cinemaabyss.example.com/api/movies
 и приложите скриншот развертывания helm и вывода https://cinemaabyss.example.com/api/movies
 
+#### Решение
+
+- [proxy-service.yaml](src/kubernetes/helm/templates/services/proxy-service.yaml) и [events-service.yaml](src/kubernetes/helm/templates/services/events-service.yaml) повторяют конфигурацию из задания 3, но образ, порты, ресурсы и число реплик берутся из `values.yaml`. Service прокси слушает порт 80 и проксирует на 8000. Под прокси перезапускается при изменении ConfigMap (аннотация `checksum/config`), поэтому `MOVIES_MIGRATION_PERCENT` можно менять через `helm upgrade --set config.moviesMigrationPercent=...`.
+- В [values.yaml](src/kubernetes/helm/values.yaml) образы указывают на `ghcr.io/mcxinus/architecture-pro-cinemaabyss/...`.
+- Исправлен ConfigMap чарта: адрес movies был `http://movies:8081` вместо `http://movies-service:8081`, а `EVENTS_SERVICE_URL` отсутствовал.
+- Ingress, как и в задании 3, направляет весь трафик только в `proxy-service`. Аннотация `kubernetes.io/ingress.class` удалена: Kubernetes не принимает её вместе с `ingressClassName`. Добавлены TLS и редирект с HTTP на HTTPS; чарт сам генерирует самоподписанный сертификат на 30 дней при первой установке (`ingress.tls.selfSigned`), ключи в репозитории не хранятся.
+- В `values.yaml` для `imagePullSecrets.dockerconfigjson` лежит пустая конфигурация `{"auths":{}}`, реальный токен передаётся при установке:
+
+```bash
+helm install cinemaabyss src/kubernetes/helm --namespace cinemaabyss --create-namespace \
+  --set imagePullSecrets.dockerconfigjson=$(base64 -w0 ~/.docker/config.json)
+```
+
+`npm run test:kubernetes` на установке через helm: 22 запроса, 42 проверки, 0 ошибок. Monolith и movies один раз перезапускаются при старте, пока Postgres не готов.
+
+Развертывание helm:
+
+![Развертывание helm](docs/screenshots/task4-helm-deploy.png)
+
+Вызов https://cinemaabyss.example.com/api/movies:
+
+![Ответ /api/movies после установки через helm](docs/screenshots/task4-helm-movies-api.png)
+
 
 # Задание 5
 Компания планирует активно развиваться и для повышения надежности, безопасности, реализации сетевых паттернов типа Circuit Breaker и канареечного деплоя вам как архитектору необходимо развернуть istio и настроить circuit breaker для monolith и movies сервисов.
@@ -414,6 +575,21 @@ You can see 21 for the upstream_rq_pending_overflow value which means 21 calls s
 ```
 
 Приложите скриншот работы circuit breaker'а
+
+#### Решение
+
+Istio 1.30 установлен из helm-чартов. `istiod` ставится раньше `istio-ingressgateway`: sidecar для gateway внедряет istiod, без него поды gateway не стартуют. После `istio-injection=enabled` поды перезапущены, у каждого появился sidecar (`2/2`).
+
+[circuit-breaker-config.yaml](src/kubernetes/circuit-breaker-config.yaml) — два `DestinationRule`, для `movies-service` и `monolith`:
+
+- `connectionPool`: одно соединение, один запрос в очереди и один запрос на соединение. Лимиты специально минимальные, чтобы 50 параллельных соединений fortio их превысили; лишние запросы sidecar сразу отклоняет с `503` (`upstream_rq_pending_overflow`).
+- `outlierDetection`: после первой ошибки 5xx под исключается из балансировки на 3 минуты. Под у каждого сервиса один, поэтому дальше sidecar отвечает `503` без обращения к сервису (`upstream_cx_none_healthy`) — это и есть разомкнутый circuit breaker.
+
+Результат: из 500 запросов до сервиса дошли только 2–3, остальные отклонены sidecar'ом fortio — около 40 по переполнению пула и около 455 пока под исключён. Postman-тесты через ingress проходят и с Istio: 42 проверки, 0 ошибок.
+
+![Circuit breaker](docs/screenshots/task5-circuit-breaker.png)
+
+Попутно исправлена причина ошибки `InconsistentClusterIdException` из задания 4. Образ `wurstmeister/zookeeper` хранит данные в `/opt/zookeeper-3.4.13/data`, а том был подключён в `/var/lib/zookeeper/data`, поэтому при каждом перезапуске Zookeeper создавал новый кластер, а Kafka хранила на своём томе старый ID. Теперь том подключён в правильный каталог ([helm](src/kubernetes/helm/templates/kafka/kafka.yaml) и [kafka.yaml](src/kubernetes/kafka/kafka.yaml)), и Kafka переживает перезапуск Zookeeper.
 
 Удаляем все
 ```bash

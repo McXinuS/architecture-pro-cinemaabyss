@@ -1,0 +1,78 @@
+@startuml cinemaabyss-tobe-containers
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+skinparam linetype ortho
+
+title Контейнерная диаграмма C4 — Кинобездна (To-Be)
+
+Person(viewer, "Зритель", "Веб, мобильное приложение и Smart TV")
+
+System_Ext(reco, "Рекомендательная система", "Подборки по просмотрам и оценкам")
+System_Ext(psp, "Платёжный провайдер", "Эквайринг")
+System_Ext(loyalty, "Лояльность и маркетплейсы", "Внешние скидки и промо")
+System_Ext(content, "Контент-провайдеры", "Стриминговые сервисы и открытые источники")
+
+System_Boundary(cinema, "Кинобездна") {
+    Container(gateway, "API Gateway", "Go", "Единая точка вызова. Маршрут REST, размер ответа по типу клиента. На миграции — Strangler Fig.")
+
+    together {
+        Container(video, "Video", "Go", "Ссылка на поток и факт просмотра")
+        Container(movies, "Movies", "Go", "Описание, жанры, актёры, оценки")
+        Container(users, "Users", "Go", "Регистрация, вход, профиль, избранное")
+    }
+    together {
+        ContainerDb(videodb, "Video DB", "PostgreSQL", "Ссылки на потоки и прогресс просмотра")
+        ContainerDb(videostore, "Video Storage", "S3-совместимое объектное хранилище + CDN", "Собственные и кэшированные видеофайлы")
+        ContainerDb(moviesdb, "Movies DB", "PostgreSQL", "Фильмы, жанры, оценки")
+        ContainerDb(usersdb, "Users DB", "PostgreSQL", "Учётные записи и избранное")
+    }
+    together {
+        Container(discounts, "Discounts", "Go", "Скидки и промокоды")
+        Container(payments, "Payments", "Go", "Платежи и статус транзакций")
+        Container(subscriptions, "Subscriptions", "Go", "Тариф и срок подписки")
+    }
+    together {
+        ContainerDb(discountsdb, "Discounts DB", "PostgreSQL", "Правила скидок")
+        ContainerDb(paymentsdb, "Payments DB", "PostgreSQL", "Платежи")
+        ContainerDb(subscriptionsdb, "Subscriptions DB", "PostgreSQL", "Подписки")
+    }
+
+    ContainerQueue(kafka, "Kafka", "Apache Kafka", "user.registered, user.logged_in, movie.added, movie.rated, movie.viewed, payment.succeeded, payment.failed")
+}
+
+viewer -down-> gateway : HTTPS
+
+gateway -down-> users : профиль и избранное\n(REST)
+gateway -[norank]-> movies : метаданные и оценка\n(REST)
+gateway -[norank]-> video : ссылка на поток\n(REST)
+gateway -[norank]-> subscriptions : проверить подписку\n(REST)
+gateway -[norank]-> payments : оплатить\n(REST)
+gateway -[norank]-> discounts : применить скидку\n(REST)
+gateway -[norank]-> reco : запросить подборку\n(REST)
+
+users -down-> usersdb : SQL
+movies -down-> moviesdb : SQL
+video -down-> videodb : SQL
+video -[norank]-> videostore : загрузка и выдача видео
+subscriptions -down-> subscriptionsdb : SQL
+payments -down-> paymentsdb : SQL
+discounts -down-> discountsdb : SQL
+
+usersdb -[hidden]down-> subscriptions
+moviesdb -[hidden]down-> payments
+videodb -[hidden]down-> discounts
+subscriptionsdb -[hidden]down-> kafka
+
+users -[norank]-> kafka : user
+movies -[norank]-> kafka : movie
+video -[norank]-> kafka : viewed
+payments -[norank]-> kafka : payment
+kafka -[norank]-> subscriptions : активация
+payments -[norank]-> discounts : сумма
+payments -[norank]-> psp : эквайринг
+discounts -[norank]-> loyalty : промо
+kafka -[norank]-> reco : viewed, rated
+video -[norank]-> content : каталог и ссылки на поток\n(API)
+
+@enduml

@@ -4,25 +4,25 @@
   "values": [
     {
       "key": "baseUrl",
-      "value": "http://cinemaabyss.example.com",
+      "value": "https://cinemaabyss.example.com",
       "type": "default",
       "enabled": true
     },
     {
       "key": "moviesServiceUrl",
-      "value": "http://cinemaabyss.example.com",
+      "value": "https://cinemaabyss.example.com",
       "type": "default",
       "enabled": true
     },
     {
       "key": "eventsServiceUrl",
-      "value": "http://cinemaabyss.example.com",
+      "value": "https://cinemaabyss.example.com",
       "type": "default",
       "enabled": true
     },
     {
       "key": "proxyServiceUrl",
-      "value": "http://cinemaabyss.example.com",
+      "value": "https://cinemaabyss.example.com",
       "type": "default",
       "enabled": true
     }

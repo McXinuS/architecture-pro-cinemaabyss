@@ -92,6 +92,7 @@ const newmanOptions = {
   },
   bail: argv.bail,
   timeoutRequest: argv.timeout,
+  insecure: argv.environment === 'kubernetes',
   delayRequest: 100 // Small delay between requests
 };
 
